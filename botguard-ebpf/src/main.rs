@@ -48,8 +48,11 @@ pub fn botguard_sentinel(ctx: ProbeContext) -> u32 {
             event.len = 0xDEED; // Special marker for Sentinel events
             
             unsafe {
-                // Read the name and get the length (including null terminator)
-                let len = bpf_probe_read_user_str_bytes(name_ptr, &mut event.packet).unwrap_or(0);
+                // Read the name and measure the resulting byte slice
+                let len = bpf_probe_read_user_str_bytes(name_ptr, &mut event.packet)
+                    .map(|s| s.len())
+                    .unwrap_or(0);
+                
                 if len > 0 {
                     event.len = len as u32;
                 }

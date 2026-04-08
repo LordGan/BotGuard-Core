@@ -1,0 +1,7 @@
+target/
+**/*.rs.bk
+Cargo.lock
+
+# eBPF artifacts
+botguard-ebpf/target
+.aya-generated

@@ -1,0 +1,10 @@
+[package]
+name = "botguard-common"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+aya = { version = "0.13.1", optional = true }
+
+[features]
+user = ["dep:aya"]

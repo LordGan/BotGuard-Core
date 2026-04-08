@@ -1,0 +1,14 @@
+[workspace]
+members = [
+    "botguard-common",
+    "botguard-ebpf",
+    "botguard-userspace",
+    "xtask",
+]
+resolver = "2"
+
+[profile.release]
+lto = true
+panic = "abort"
+
+# We'll use cargo xtask build-ebpf to compile the kernel code

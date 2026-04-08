@@ -1,0 +1,13 @@
+[package]
+name = "botguard-ebpf"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+aya-ebpf = "0.1.0"
+aya-log-ebpf = "0.1.0"
+botguard-common = { path = "../botguard-common" }
+
+[[bin]]
+name = "botguard"
+path = "src/main.rs"

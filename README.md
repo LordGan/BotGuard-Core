@@ -1,6 +1,6 @@
-# BotGuard Core: eBPF-Powered ROS 2 Sentinel 🛰️🛡️🦾
+# BotGuard-Core: eBPF-Powered ROS 2 Sentinel 🛰️🛡️🦾
 
-**BotGuard Core** is a next-generation security monitor for ROS 2. Built on **eBPF (Extended Berkeley Packet Filter)**, it operates within the Linux kernel to provide "Zero Trust" visibility into your robot's software ecosystem. 
+**BotGuard-Core** is a next-generation security monitor for ROS 2. Built on **eBPF (Extended Berkeley Packet Filter)**, it operates within the Linux kernel to provide "Zero Trust" visibility into your robot's software ecosystem. 
 
 Unlike standard firewalls or network sniffers, BotGuard is **application-aware**, identifying ROS 2 nodes "at birth" before they even send their first packet.
 

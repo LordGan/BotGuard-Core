@@ -4,7 +4,6 @@ use aya::maps::perf::AsyncPerfEventArray;
 use aya_log::EbpfLogger;
 use botguard_common::PacketEvent;
 use bytes::BytesMut;
-use tokio::time::sleep;
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -28,6 +27,10 @@ struct NodeInfo {
     proc_name: String,
     last_seen: Instant,
     packets: u64,
+    pubs: u32,
+    subs: u32,
+    srvs: u32,
+    clis: u32,
 }
 
 struct MonitorState {
@@ -92,15 +95,15 @@ async fn main() -> anyhow::Result<()> {
     let _ = attach_tracepoint(bpf, "botguard_sendto", "syscalls", "sys_enter_sendto");
     let _ = attach_tracepoint(bpf, "botguard_sendmsg", "syscalls", "sys_enter_sendmsg");
 
-    // Attach Sentinel
+    // Attach Sentinels
     let rmw_lib = "/opt/ros/humble/lib/librmw_fastrtps_cpp.so";
     if std::path::Path::new(rmw_lib).exists() {
-        if let Ok(program) = bpf.program_mut("botguard_sentinel").unwrap().try_into() {
-            let prog: &mut UProbe = program;
-            let _ = prog.load();
-            let _ = prog.attach(Some("rmw_create_node"), 0, rmw_lib, None);
-            state.lock().unwrap().active_rmw = rmw_lib.to_string();
-        }
+        attach_uprobe(bpf, "botguard_node_sentinel", "rmw_create_node", rmw_lib)?;
+        attach_uprobe(bpf, "botguard_pub_sentinel", "rmw_create_publisher", rmw_lib)?;
+        attach_uprobe(bpf, "botguard_sub_sentinel", "rmw_create_subscription", rmw_lib)?;
+        attach_uprobe(bpf, "botguard_srv_sentinel", "rmw_create_service", rmw_lib)?;
+        attach_uprobe(bpf, "botguard_cli_sentinel", "rmw_create_client", rmw_lib)?;
+        state.lock().unwrap().active_rmw = rmw_lib.to_string();
     }
 
     let perf_array = AsyncPerfEventArray::try_from(bpf.map_mut("EVENTS").unwrap())?;
@@ -137,19 +140,44 @@ async fn main() -> anyhow::Result<()> {
                         proc_name: get_process_name(raw_event.pid),
                         last_seen: Instant::now(),
                         packets: 0,
+                        pubs: 0,
+                        subs: 0,
+                        srvs: 0,
+                        clis: 0,
                     });
                     
                     node.last_seen = Instant::now();
                     node.packets += 1;
 
-                    if raw_event.len == 0xDEED || (raw_event.len > 0 && raw_event.len < 128) {
-                        // Handle Sentinel or Potential string discovery
+                    if raw_event.len > 0 && raw_event.len < 128 {
                         if let Ok(name) = std::str::from_utf8(data) {
                             let cleaned = name.trim_matches(char::from(0)).trim();
-                            if !cleaned.is_empty() && cleaned.len() > 2 {
-                                if node.name == "Unknown" || raw_event.len == 0xDEED {
-                                    node.name = cleaned.to_string();
-                                    s.add_event(format!("➕ Node Born: [{}] (PID: {})", cleaned, raw_event.pid));
+                            if !cleaned.is_empty() {
+                                use botguard_common::EventType;
+                                match raw_event.event_type {
+                                    EventType::Node => {
+                                        if node.name == "Unknown" {
+                                            node.name = cleaned.to_string();
+                                            s.add_event(format!("➕ Node Born: [{}] (PID: {})", cleaned, raw_event.pid));
+                                        }
+                                    }
+                                    EventType::Publisher => {
+                                        node.pubs += 1;
+                                        s.add_event(format!("📡 Pub Create: [{}] (PID: {})", cleaned, raw_event.pid));
+                                    }
+                                    EventType::Subscription => {
+                                        node.subs += 1;
+                                        s.add_event(format!("📥 Sub Create: [{}] (PID: {})", cleaned, raw_event.pid));
+                                    }
+                                    EventType::Service => {
+                                        node.srvs += 1;
+                                        s.add_event(format!("⚙️ Srv Create: [{}] (PID: {})", cleaned, raw_event.pid));
+                                    }
+                                    EventType::Client => {
+                                        node.clis += 1;
+                                        s.add_event(format!("🔗 Cli Create: [{}] (PID: {})", cleaned, raw_event.pid));
+                                    }
+                                    _ => {}
                                 }
                             }
                         }
@@ -199,6 +227,15 @@ fn attach_tracepoint(bpf: &mut Ebpf, name: &str, category: &str, event: &str) ->
     Ok(())
 }
 
+fn attach_uprobe(bpf: &mut Ebpf, prog_name: &str, symbol: &str, lib: &str) -> anyhow::Result<()> {
+    if let Some(program) = bpf.program_mut(prog_name) {
+        let prog: &mut UProbe = program.try_into()?;
+        prog.load()?;
+        prog.attach(Some(symbol), 0, lib, None)?;
+    }
+    Ok(())
+}
+
 fn ui(f: &mut Frame, state: &MonitorState) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -216,7 +253,7 @@ fn ui(f: &mut Frame, state: &MonitorState) {
     f.render_widget(title, chunks[0]);
 
     // Node Table
-    let header_cells = ["PID", "Node Name", "Binary", "Packets", "Seen"]
+    let header_cells = ["PID", "Node Name", "Binary", "Pub/Sub", "Srv/Cli", "Pkts", "Seen"]
         .iter()
         .map(|h| Cell::from(*h).style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)));
     let header = Row::new(header_cells).height(1).bottom_margin(1);
@@ -226,6 +263,8 @@ fn ui(f: &mut Frame, state: &MonitorState) {
             Cell::from(pid.to_string()),
             Cell::from(info.name.clone()),
             Cell::from(format!("({})", info.proc_name)),
+            Cell::from(format!("{}/{}", info.pubs, info.subs)),
+            Cell::from(format!("{}/{}", info.srvs, info.clis)),
             Cell::from(info.packets.to_string()),
             Cell::from(format!("{:?} ago", info.last_seen.elapsed())),
         ];
@@ -233,11 +272,13 @@ fn ui(f: &mut Frame, state: &MonitorState) {
     });
 
     let table = Table::new(rows, [
+        Constraint::Percentage(8),
+        Constraint::Percentage(30),
+        Constraint::Percentage(18),
         Constraint::Percentage(10),
-        Constraint::Percentage(35),
-        Constraint::Percentage(20),
-        Constraint::Percentage(15),
-        Constraint::Percentage(20),
+        Constraint::Percentage(10),
+        Constraint::Percentage(8),
+        Constraint::Percentage(16),
     ])
     .header(header)
     .block(Block::default().borders(Borders::ALL).title("Active ROS 2 / System Nodes"))

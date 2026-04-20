@@ -7,7 +7,7 @@ use aya_ebpf::{
     programs::{TracePointContext, ProbeContext},
     helpers::{bpf_get_current_pid_tgid, bpf_probe_read_user, bpf_probe_read_user_str_bytes},
 };
-use botguard_common::PacketEvent;
+use botguard_common::{PacketEvent, EventType};
 
 #[map]
 static mut EVENTS: PerfEventArray<PacketEvent> = PerfEventArray::new(0);
@@ -23,51 +23,73 @@ pub fn botguard_sendto(ctx: TracePointContext) -> u32 {
 
 #[tracepoint]
 pub fn botguard_sendmsg(ctx: TracePointContext) -> u32 {
-    // For sendmsg, the buffer is inside a struct, but we can still 
-    // try to read the raw pointer at 24 for a quick peek or just focus on sendto first.
     let _ = try_botguard_capture(&ctx, 24, 32); 
     0
 }
 
 #[uprobe]
-pub fn botguard_sentinel(ctx: ProbeContext) -> u32 {
-    let pid = (bpf_get_current_pid_tgid() >> 32) as u32;
-
-    // x86_64 Calling Convention:
-    // arg0: rdi, arg1: rsi, arg2: rdx
-    // x86_64 Calling Convention:
-    // arg0: rdi, arg1: rsi, arg2: rdx
+pub fn botguard_node_sentinel(ctx: ProbeContext) -> u32 {
     let regs = unsafe { &*ctx.regs };
     let name_ptr = regs.rsi as *const u8;
-    let _ns_ptr = regs.rdx as *const u8;
+    handle_sentinel(&ctx, name_ptr, EventType::Node)
+}
+
+#[uprobe]
+pub fn botguard_pub_sentinel(ctx: ProbeContext) -> u32 {
+    let regs = unsafe { &*ctx.regs };
+    let name_ptr = regs.rdx as *const u8;
+    handle_sentinel(&ctx, name_ptr, EventType::Publisher)
+}
+
+#[uprobe]
+pub fn botguard_sub_sentinel(ctx: ProbeContext) -> u32 {
+    let regs = unsafe { &*ctx.regs };
+    let name_ptr = regs.rdx as *const u8;
+    handle_sentinel(&ctx, name_ptr, EventType::Subscription)
+}
+
+#[uprobe]
+pub fn botguard_srv_sentinel(ctx: ProbeContext) -> u32 {
+    let regs = unsafe { &*ctx.regs };
+    let name_ptr = regs.rdx as *const u8;
+    handle_sentinel(&ctx, name_ptr, EventType::Service)
+}
+
+#[uprobe]
+pub fn botguard_cli_sentinel(ctx: ProbeContext) -> u32 {
+    let regs = unsafe { &*ctx.regs };
+    let name_ptr = regs.rdx as *const u8;
+    handle_sentinel(&ctx, name_ptr, EventType::Client)
+}
+
+fn handle_sentinel(ctx: &ProbeContext, name_ptr: *const u8, event_type: EventType) -> u32 {
+    let pid = (bpf_get_current_pid_tgid() >> 32) as u32;
 
     if name_ptr as usize > 0 {
         if let Some(ptr) = unsafe { SCRATCHPAD.get_ptr_mut(0) } {
             let event = unsafe { &mut *ptr };
             event.pid = pid;
-            event.len = 0xDEED; // Special marker for Sentinel events
+            event.event_type = event_type;
+            event.len = 0;
             
             unsafe {
-                // Read the name and measure the resulting byte slice
                 let len = bpf_probe_read_user_str_bytes(name_ptr, &mut event.packet)
                     .map(|s| s.len())
                     .unwrap_or(0);
                 
                 if len > 0 {
                     event.len = len as u32;
+                    let _ = EVENTS.output(ctx, event, 0);
                 }
-                let _ = EVENTS.output(&ctx, event, 0);
             }
         }
     }
-
     0
 }
 
 fn try_botguard_capture(ctx: &TracePointContext, buff_off: usize, len_off: usize) -> Result<u32, u32> {
     let pid = (bpf_get_current_pid_tgid() >> 32) as u32;
     
-    // Read buffer pointer and length
     let buff_ptr: *const u8 = unsafe { ctx.read_at(buff_off).map_err(|_| 0u32)? };
     let len: usize = unsafe { ctx.read_at(len_off).map_err(|_| 0u32)? };
 
@@ -79,11 +101,10 @@ fn try_botguard_capture(ctx: &TracePointContext, buff_off: usize, len_off: usize
 
         event.pid = pid;
         event.len = len as u32;
+        event.event_type = EventType::RawPacket;
 
         unsafe {
-            // High-level safe read for 128 bytes (fits on stack)
             event.packet = bpf_probe_read_user(buff_ptr as *const [u8; 128]).map_err(|_| 0u32)?;
-            
             EVENTS.output(ctx, event, 0);
         }
     }

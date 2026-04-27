@@ -2,18 +2,29 @@
 #![no_main]
 
 use aya_ebpf::{
-    macros::{tracepoint, map, uprobe},
+    macros::{tracepoint, map, uprobe, classifier},
     maps::{PerfEventArray, PerCpuArray},
-    programs::{TracePointContext, ProbeContext},
+    programs::{TracePointContext, ProbeContext, TcContext},
     helpers::{bpf_get_current_pid_tgid, bpf_probe_read_user, bpf_probe_read_user_str_bytes},
 };
 use botguard_common::{PacketEvent, EventType};
+use network_types::{
+    eth::{EthHdr, EtherType},
+    ip::Ipv4Hdr,
+    udp::UdpHdr,
+};
 
 #[map]
 static mut EVENTS: PerfEventArray<PacketEvent> = PerfEventArray::new(0);
 
 #[map]
 static mut SCRATCHPAD: PerCpuArray<PacketEvent> = PerCpuArray::with_max_entries(1, 0);
+
+#[classifier]
+pub fn botguard_network_sentinel(ctx: TcContext) -> i32 {
+    let _ = try_botguard_network_capture(&ctx);
+    0
+}
 
 #[tracepoint]
 pub fn botguard_sendto(ctx: TracePointContext) -> u32 {
@@ -71,6 +82,8 @@ fn handle_sentinel(ctx: &ProbeContext, name_ptr: *const u8, event_type: EventTyp
             event.pid = pid;
             event.event_type = event_type;
             event.len = 0;
+            event.src_ip = 0;
+            event.src_mac = [0; 6];
             
             unsafe {
                 let len = bpf_probe_read_user_str_bytes(name_ptr, &mut event.packet)
@@ -102,6 +115,8 @@ fn try_botguard_capture(ctx: &TracePointContext, buff_off: usize, len_off: usize
         event.pid = pid;
         event.len = len as u32;
         event.event_type = EventType::RawPacket;
+        event.src_ip = 0;
+        event.src_mac = [0; 6];
 
         unsafe {
             event.packet = bpf_probe_read_user(buff_ptr as *const [u8; 128]).map_err(|_| 0u32)?;
@@ -110,6 +125,52 @@ fn try_botguard_capture(ctx: &TracePointContext, buff_off: usize, len_off: usize
     }
 
     Ok(0)
+}
+
+fn try_botguard_network_capture(ctx: &TcContext) -> Result<(), ()> {
+
+    let eth_hdr: EthHdr = ctx.load(0).map_err(|_| ())?;
+    let ether_type = eth_hdr.ether_type;
+    if ether_type != EtherType::Ipv4 {
+        return Ok(());
+    }
+
+    let ip_hdr: Ipv4Hdr = ctx.load(EthHdr::LEN).map_err(|_| ())?;
+    let proto = ip_hdr.proto;
+    if proto != network_types::ip::IpProto::Udp {
+        return Ok(());
+    }
+
+    let udp_hdr: UdpHdr = ctx.load(EthHdr::LEN + Ipv4Hdr::LEN).map_err(|_| ())?;
+    let dest_port = u16::from_be(udp_hdr.dest);
+    let src_port = u16::from_be(udp_hdr.source);
+    
+    if (dest_port < 7400 || dest_port > 7500) && (src_port < 7400 || src_port > 7500) {
+        return Ok(());
+    }
+    if let Some(ptr) = unsafe { SCRATCHPAD.get_ptr_mut(0) } {
+        let event = unsafe { &mut *ptr };
+        event.pid = 0;
+        event.event_type = EventType::ExternalNode;
+        event.src_ip = u32::from_be(ip_hdr.src_addr);
+        event.src_mac = eth_hdr.src_addr;
+        
+        let payload_off = EthHdr::LEN + Ipv4Hdr::LEN + UdpHdr::LEN;
+        
+        let skb_len = ctx.len() as usize;
+        if skb_len > payload_off {
+             let _ = ctx.load_bytes(payload_off, &mut event.packet).map_err(|_| ())?;
+             event.len = 128;
+        } else {
+            event.len = 0;
+        }
+
+        unsafe {
+            EVENTS.output(ctx, event, 0);
+        }
+    }
+
+    Ok(())
 }
 
 #[panic_handler]

@@ -1,7 +1,5 @@
 #![no_std]
 
-// The size of the packet buffer we'll send to userspace.
-// Reduced to 128 to strictly stay within the 512-byte BPF stack limit.
 pub const MAX_PACKET_SIZE: usize = 128;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -13,6 +11,7 @@ pub enum EventType {
     Service = 3,
     Client = 4,
     RawPacket = 5,
+    ExternalNode = 6,
 }
 
 #[derive(Clone, Copy)]
@@ -21,6 +20,8 @@ pub struct PacketEvent {
     pub pid: u32,
     pub len: u32,
     pub event_type: EventType,
+    pub src_ip: u32,
+    pub src_mac: [u8; 6],
     pub packet: [u8; MAX_PACKET_SIZE],
 }
 

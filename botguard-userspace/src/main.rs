@@ -1,4 +1,4 @@
-use aya::programs::{TracePoint, UProbe};
+use aya::programs::{TracePoint, UProbe, SchedClassifier, tc};
 use aya::{include_bytes_aligned, Ebpf};
 use aya::maps::perf::AsyncPerfEventArray;
 use aya_log::EbpfLogger;
@@ -8,7 +8,6 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-// TUI Imports
 use ratatui::{
     backend::CrosstermBackend,
     widgets::{Block, Borders, List, ListItem, Table, Row, Cell, Paragraph},
@@ -31,10 +30,12 @@ struct NodeInfo {
     subs: u32,
     srvs: u32,
     clis: u32,
+    src_ip: Option<String>,
+    src_mac: Option<String>,
 }
 
 struct MonitorState {
-    nodes: HashMap<u32, NodeInfo>,
+    nodes: HashMap<String, NodeInfo>,
     recent_events: VecDeque<String>,
     active_rmw: String,
 }
@@ -58,7 +59,7 @@ impl MonitorState {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // Setup TUI
+
     enable_raw_mode()?;
     let mut stdout = std::io::stdout();
     execute!(stdout, EnterAlternateScreen)?;
@@ -67,16 +68,13 @@ async fn main() -> anyhow::Result<()> {
 
     let state = Arc::new(Mutex::new(MonitorState::new()));
     
-    // Bump rlimit
     let rlim = libc::rlimit {
         rlim_cur: libc::RLIM_INFINITY,
         rlim_max: libc::RLIM_INFINITY,
     };
     if unsafe { libc::setrlimit(libc::RLIMIT_MEMLOCK, &rlim) } != 0 {
-        // Fallback for UI log
     }
 
-    // Load eBPF
     let bpf_res = Ebpf::load(include_bytes_aligned!(
         "../../target/bpfel-unknown-none/release/botguard"
     ));
@@ -91,11 +89,9 @@ async fn main() -> anyhow::Result<()> {
 
     let _ = EbpfLogger::init(bpf);
 
-    // Attach Tracepoints
     let _ = attach_tracepoint(bpf, "botguard_sendto", "syscalls", "sys_enter_sendto");
     let _ = attach_tracepoint(bpf, "botguard_sendmsg", "syscalls", "sys_enter_sendmsg");
 
-    // Attach Sentinels
     let rmw_lib = "/opt/ros/humble/lib/librmw_fastrtps_cpp.so";
     if std::path::Path::new(rmw_lib).exists() {
         attach_uprobe(bpf, "botguard_node_sentinel", "rmw_create_node", rmw_lib)?;
@@ -104,6 +100,15 @@ async fn main() -> anyhow::Result<()> {
         attach_uprobe(bpf, "botguard_srv_sentinel", "rmw_create_service", rmw_lib)?;
         attach_uprobe(bpf, "botguard_cli_sentinel", "rmw_create_client", rmw_lib)?;
         state.lock().unwrap().active_rmw = rmw_lib.to_string();
+    }
+
+    let iface = "docker0"; 
+    
+    match attach_tc(bpf, "botguard_network_sentinel", iface) {
+        Ok(_) => state.lock().unwrap().recent_events.push_front(format!("🌐 Sentinel Active on: {}", iface)),
+        Err(e) => {
+            state.lock().unwrap().recent_events.push_front(format!("❌ Sentinel Failed on {}: {}", iface, e));
+        }
     }
 
     let perf_array = AsyncPerfEventArray::try_from(bpf.map_mut("EVENTS").unwrap())?;
@@ -135,47 +140,69 @@ async fn main() -> anyhow::Result<()> {
                     let data = &raw_event.packet[..packet_len];
 
                     let mut s = state.lock().unwrap();
-                    let node = s.nodes.entry(raw_event.pid).or_insert_with(|| NodeInfo {
+                    let key = if raw_event.pid > 0 {
+                        raw_event.pid.to_string()
+                    } else if raw_event.src_ip != 0 {
+                        format!("{:08x}", raw_event.src_ip)
+                    } else {
+                        "0".to_string()
+                    };
+
+                    let mut event_msg = None;
+                    let node = s.nodes.entry(key).or_insert_with(|| NodeInfo {
                         name: "Unknown".to_string(),
-                        proc_name: get_process_name(raw_event.pid),
+                        proc_name: if raw_event.pid > 0 { get_process_name(raw_event.pid) } else { "REMOTE".to_string() },
                         last_seen: Instant::now(),
                         packets: 0,
                         pubs: 0,
                         subs: 0,
                         srvs: 0,
                         clis: 0,
+                        src_ip: if raw_event.src_ip != 0 { Some(format_ip(raw_event.src_ip)) } else { None },
+                        src_mac: if raw_event.src_mac != [0; 6] { Some(format_mac(raw_event.src_mac)) } else { None },
                     });
                     
                     node.last_seen = Instant::now();
                     node.packets += 1;
 
-                    if raw_event.len > 0 && raw_event.len < 128 {
+                    if raw_event.len > 0 && raw_event.len <= 128 {
                         if let Ok(name) = std::str::from_utf8(data) {
                             let cleaned = name.trim_matches(char::from(0)).trim();
+                            
+                            use botguard_common::EventType;
+                            if raw_event.event_type == EventType::ExternalNode && node.name == "Unknown" {
+                                node.name = "Remote Participant".to_string();
+                            }
+
                             if !cleaned.is_empty() {
-                                use botguard_common::EventType;
                                 match raw_event.event_type {
                                     EventType::Node => {
-                                        if node.name == "Unknown" {
+                                        if node.name == "Unknown" || node.name == "Remote Participant" {
                                             node.name = cleaned.to_string();
-                                            s.add_event(format!("➕ Node Born: [{}] (PID: {})", cleaned, raw_event.pid));
+                                            event_msg = Some(format!("➕ Node Born: [{}] (PID: {})", cleaned, raw_event.pid));
                                         }
                                     }
                                     EventType::Publisher => {
                                         node.pubs += 1;
-                                        s.add_event(format!("📡 Pub Create: [{}] (PID: {})", cleaned, raw_event.pid));
+                                        event_msg = Some(format!("📡 Pub Create: [{}] (PID: {})", cleaned, raw_event.pid));
                                     }
                                     EventType::Subscription => {
                                         node.subs += 1;
-                                        s.add_event(format!("📥 Sub Create: [{}] (PID: {})", cleaned, raw_event.pid));
+                                        event_msg = Some(format!("📥 Sub Create: [{}] (PID: {})", cleaned, raw_event.pid));
                                     }
                                     EventType::Service => {
                                         node.srvs += 1;
-                                        s.add_event(format!("⚙️ Srv Create: [{}] (PID: {})", cleaned, raw_event.pid));
+                                        event_msg = Some(format!("⚙️ Srv Create: [{}] (PID: {})", cleaned, raw_event.pid));
                                     }
                                     EventType::Client => {
                                         node.clis += 1;
-                                        s.add_event(format!("🔗 Cli Create: [{}] (PID: {})", cleaned, raw_event.pid));
+                                        event_msg = Some(format!("🔗 Cli Create: [{}] (PID: {})", cleaned, raw_event.pid));
+                                    }
+                                    EventType::ExternalNode => {
+                                         if !cleaned.contains("RTPS") {
+                                            node.name = cleaned.to_string();
+                                         }
+                                         event_msg = Some(format!("🌐 Remote Node activity from {}", node.src_ip.as_deref().unwrap_or("?")));
                                     }
                                     _ => {}
                                 }
@@ -183,14 +210,17 @@ async fn main() -> anyhow::Result<()> {
                         }
                     } else if let Some(discovered_name) = find_node_name(data) {
                         node.name = discovered_name.clone();
-                        s.add_event(format!("🤖 Discovery: [{}] (PID: {})", discovered_name, raw_event.pid));
+                        event_msg = Some(format!("🤖 Discovery: [{}] (PID: {})", discovered_name, raw_event.pid));
+                    }
+                    
+                    if let Some(msg) = event_msg {
+                        s.add_event(msg);
                     }
                 }
             }
         });
     }
 
-    // UI Render Loop
     loop {
         terminal.draw(|f| ui(f, &state.lock().unwrap()))?;
 
@@ -207,7 +237,6 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    // Cleanup
     restore_terminal(&mut terminal)?;
     Ok(())
 }
@@ -236,6 +265,22 @@ fn attach_uprobe(bpf: &mut Ebpf, prog_name: &str, symbol: &str, lib: &str) -> an
     Ok(())
 }
 
+fn attach_tc(bpf: &mut Ebpf, prog_name: &str, iface: &str) -> anyhow::Result<()> {
+    let _ = tc::qdisc_add_clsact(iface);
+    let program: &mut SchedClassifier = bpf.program_mut(prog_name).unwrap().try_into()?;
+    program.load()?;
+    program.attach(iface, tc::TcAttachType::Ingress)?;
+    Ok(())
+}
+
+fn format_ip(ip: u32) -> String {
+    format!("{}.{}.{}.{}", (ip >> 24) & 0xFF, (ip >> 16) & 0xFF, (ip >> 8) & 0xFF, ip & 0xFF)
+}
+
+fn format_mac(mac: [u8; 6]) -> String {
+    format!("{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}", mac[0], mac[1], mac[2], mac[3], mac[4], mac[5])
+}
+
 fn ui(f: &mut Frame, state: &MonitorState) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -247,22 +292,42 @@ fn ui(f: &mut Frame, state: &MonitorState) {
         ].as_ref())
         .split(f.size());
 
-    // Title
     let title = Paragraph::new(format!("🛡️ BotGuard Core Sentinel | Active RMW: {}", state.active_rmw))
         .block(Block::default().borders(Borders::ALL).title("Status"));
     f.render_widget(title, chunks[0]);
 
-    // Node Table
-    let header_cells = ["PID", "Node Name", "Binary", "Pub/Sub", "Srv/Cli", "Pkts", "Seen"]
+    let header_cells = ["Identity", "Source", "Pub/Sub", "Srv/Cli", "Pkts", "Seen"]
         .iter()
         .map(|h| Cell::from(*h).style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)));
     let header = Row::new(header_cells).height(1).bottom_margin(1);
 
-    let rows = state.nodes.iter().map(|(pid, info)| {
+    let mut sorted_nodes: Vec<(&String, &NodeInfo)> = state.nodes.iter().collect();
+    sorted_nodes.sort_by(|a, b| {
+        let a_prio = if a.1.src_ip.is_some() { 2 } else if a.1.name != "Unknown" { 1 } else { 0 };
+        let b_prio = if b.1.src_ip.is_some() { 2 } else if b.1.name != "Unknown" { 1 } else { 0 };
+
+        if a_prio != b_prio {
+            b_prio.cmp(&a_prio)
+        } else {
+            b.1.last_seen.cmp(&a.1.last_seen)
+        }
+    });
+
+    let rows = sorted_nodes.iter().map(|(id, info)| {
+        let identity = if info.src_ip.is_some() {
+            format!("🌐 {}", info.name)
+        } else {
+            format!("🛡️ {}", info.name)
+        };
+        let source = if let Some(ip) = &info.src_ip {
+            format!("{} ({})", ip, info.src_mac.as_deref().unwrap_or("?"))
+        } else {
+            format!("PID: {} ({})", id, info.proc_name)
+        };
+
         let cells = vec![
-            Cell::from(pid.to_string()),
-            Cell::from(info.name.clone()),
-            Cell::from(format!("({})", info.proc_name)),
+            Cell::from(identity),
+            Cell::from(source),
             Cell::from(format!("{}/{}", info.pubs, info.subs)),
             Cell::from(format!("{}/{}", info.srvs, info.clis)),
             Cell::from(info.packets.to_string()),
@@ -272,13 +337,12 @@ fn ui(f: &mut Frame, state: &MonitorState) {
     });
 
     let table = Table::new(rows, [
-        Constraint::Percentage(8),
-        Constraint::Percentage(30),
-        Constraint::Percentage(18),
+        Constraint::Percentage(25),
+        Constraint::Percentage(25),
         Constraint::Percentage(10),
         Constraint::Percentage(10),
-        Constraint::Percentage(8),
-        Constraint::Percentage(16),
+        Constraint::Percentage(10),
+        Constraint::Percentage(20),
     ])
     .header(header)
     .block(Block::default().borders(Borders::ALL).title("Active ROS 2 / System Nodes"))
@@ -286,7 +350,6 @@ fn ui(f: &mut Frame, state: &MonitorState) {
     
     f.render_widget(table, chunks[1]);
 
-    // Event Stream
     let events: Vec<ListItem> = state.recent_events
         .iter()
         .map(|e| ListItem::new(e.clone()))

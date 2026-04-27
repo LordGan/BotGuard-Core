@@ -14,43 +14,38 @@ The primary goal of BotGuard Core is to solve the **"Invisibility Problem"** in 
 
 ---
 
-## 🚀 Final Features (Current State)
-*   **Sentinel Engine**: Hooks directly into `rmw_create_node` within the ROS 2 middleware using Uprobes for 100% identification reliability.
-*   **Process Unmasker**: Automatically resolves PIDs to their binary names (e.g., `firefox`, `talker`, `pulseaudio`) to distinguish system noise from robot traffic.
-*   **Deep Packet Inspection (DPI)**: Real-time RTPS discovery parsing to identify node names and topics.
-*   **Live Dashboard**: A professional Terminal UI (TUI) providing real-time situational awareness.
+## 🚀 Features (Current State)
+*   **Sentinel Engine**: Hooks directly into `rmw_create_node` using Uprobes for 100% internal identification reliability.
+*   **Network Identity**: Kernel TC (Traffic Control) monitor captures Source IP and MAC addresses of remote participants.
+*   **Deep Packet Inspection (DPI)**: Real-time RTPS discovery parsing to "unmask" both local and remote nodes.
+*   **Live Dashboard**: A Terminal UI (TUI) with prioritized sorting (Remote > Local > Noise).
 
 ---
 
 ## 🛠️ How to Run
-
-### Prerequisites
-*   Ubuntu 22.04+ (Kernel 5.15+)
-*   ROS 2 Humble (installed at `/opt/ros/humble`)
-*   Rust (Nightly toolchain for eBPF)
 
 ### 1. Build the eBPF Kernel
 ```bash
 cargo +nightly run --package xtask -- build-ebpf
 ```
 
-### 2. Build the Userspace Dashboard
+### 2. Launch the Monitor
 ```bash
 cargo build --package botguard-userspace
-```
-
-### 3. Launch the Monitor
-```bash
 sudo ./target/debug/botguard-userspace
 ```
-*Press **'q'** to exit and restore the terminal.*
 
----
+### 🌐 Monitoring Different Interfaces
+By default, the network sentinel guards `eth0`. To monitor a different interface (like WiFi or Docker), update `botguard-userspace/src/main.rs`:
 
-## 🗺️ Roadmap: The Next Update
-The current version focuses on **Internal Identification and Monitoring**. The next milestone includes:
-*   **Identifying External Packets**: Auto-detecting and flagging traffic from unauthorized IP addresses on the network.
-*   **XDP Sentinel Firewall**: Implementing the kernel-level "Pruning" engine (XDP_DROP) to block unauthorized traffic before it reaches the ROS 2 stack.
+```rust
+let iface = "wlan0"; // For WiFi Robots
+// let iface = "docker0"; // For Simulation
+```
+
+## 🛡️ Identity Types
+- 🛡️ **[Internal]**: Detected via kernel Uprobes. Shows **PID** and **Binary Name**.
+- 🌐 **[External]**: Detected via Kernel TC monitor. Shows **IP** and **MAC Address**.
 
 ---
 

@@ -25,13 +25,21 @@ struct NodeInfo {
     name: String,
     proc_name: String,
     last_seen: Instant,
-    packets: u64,
+    pkts_sent: u64,
+    pkts_recv: u64,
+    bytes_sent: u64,
+    bytes_recv: u64,
     pubs: u32,
     subs: u32,
     srvs: u32,
     clis: u32,
     src_ip: Option<String>,
     src_mac: Option<String>,
+    bytes_sent_prev: u64,
+    bytes_recv_prev: u64,
+    tx_rate: f64,
+    rx_rate: f64,
+    last_rate_calc: Instant,
 }
 
 struct MonitorState {
@@ -54,6 +62,24 @@ impl MonitorState {
             self.recent_events.pop_back();
         }
         self.recent_events.push_front(event);
+    }
+
+    fn update_rates(&mut self) {
+        let now = Instant::now();
+        for node in self.nodes.values_mut() {
+            let elapsed = now.duration_since(node.last_rate_calc).as_secs_f64();
+            if elapsed >= 0.95 {
+                let sent_diff = node.bytes_sent.saturating_sub(node.bytes_sent_prev);
+                let recv_diff = node.bytes_recv.saturating_sub(node.bytes_recv_prev);
+                
+                node.tx_rate = sent_diff as f64 / elapsed;
+                node.rx_rate = recv_diff as f64 / elapsed;
+                
+                node.bytes_sent_prev = node.bytes_sent;
+                node.bytes_recv_prev = node.bytes_recv;
+                node.last_rate_calc = now;
+            }
+        }
     }
 }
 
@@ -139,6 +165,18 @@ async fn main() -> anyhow::Result<()> {
                     let packet_len = (raw_event.len as usize).min(botguard_common::MAX_PACKET_SIZE);
                     let data = &raw_event.packet[..packet_len];
 
+                    use botguard_common::EventType;
+                    let is_uprobe = matches!(
+                        raw_event.event_type,
+                        EventType::Node | EventType::Publisher | EventType::Subscription | EventType::Service | EventType::Client
+                    );
+
+                    if !is_uprobe {
+                        if data.len() < 4 || data[0] != b'R' || data[1] != b'T' || data[2] != b'P' || data[3] != b'S' {
+                            continue;
+                        }
+                    }
+
                     let mut s = state.lock().unwrap();
                     let key = if raw_event.pid > 0 {
                         raw_event.pid.to_string()
@@ -153,64 +191,81 @@ async fn main() -> anyhow::Result<()> {
                         name: "Unknown".to_string(),
                         proc_name: if raw_event.pid > 0 { get_process_name(raw_event.pid) } else { "REMOTE".to_string() },
                         last_seen: Instant::now(),
-                        packets: 0,
+                        pkts_sent: 0,
+                        pkts_recv: 0,
+                        bytes_sent: 0,
+                        bytes_recv: 0,
                         pubs: 0,
                         subs: 0,
                         srvs: 0,
                         clis: 0,
                         src_ip: if raw_event.src_ip != 0 { Some(format_ip(raw_event.src_ip)) } else { None },
                         src_mac: if raw_event.src_mac != [0; 6] { Some(format_mac(raw_event.src_mac)) } else { None },
+                        bytes_sent_prev: 0,
+                        bytes_recv_prev: 0,
+                        tx_rate: 0.0,
+                        rx_rate: 0.0,
+                        last_rate_calc: Instant::now(),
                     });
                     
                     node.last_seen = Instant::now();
-                    node.packets += 1;
 
-                    if raw_event.len > 0 && raw_event.len <= 128 {
-                        if let Ok(name) = std::str::from_utf8(data) {
-                            let cleaned = name.trim_matches(char::from(0)).trim();
-                            
-                            use botguard_common::EventType;
-                            if raw_event.event_type == EventType::ExternalNode && node.name == "Unknown" {
-                                node.name = "Remote Participant".to_string();
-                            }
-
-                            if !cleaned.is_empty() {
-                                match raw_event.event_type {
-                                    EventType::Node => {
-                                        if node.name == "Unknown" || node.name == "Remote Participant" {
-                                            node.name = cleaned.to_string();
-                                            event_msg = Some(format!("➕ Node Born: [{}] (PID: {})", cleaned, raw_event.pid));
+                    if is_uprobe {
+                        if raw_event.len > 0 {
+                            if let Ok(name) = std::str::from_utf8(data) {
+                                let cleaned = name.trim_matches(char::from(0)).trim();
+                                if !cleaned.is_empty() {
+                                    match raw_event.event_type {
+                                        EventType::Node => {
+                                            if node.name == "Unknown" || node.name == "Remote Participant" {
+                                                node.name = cleaned.to_string();
+                                                event_msg = Some(format!("➕ Node Born: [{}] (PID: {})", cleaned, raw_event.pid));
+                                            }
                                         }
+                                        EventType::Publisher => {
+                                            node.pubs += 1;
+                                            event_msg = Some(format!("📡 Pub Create: [{}] (PID: {})", cleaned, raw_event.pid));
+                                        }
+                                        EventType::Subscription => {
+                                            node.subs += 1;
+                                            event_msg = Some(format!("📥 Sub Create: [{}] (PID: {})", cleaned, raw_event.pid));
+                                        }
+                                        EventType::Service => {
+                                            node.srvs += 1;
+                                            event_msg = Some(format!("⚙️ Srv Create: [{}] (PID: {})", cleaned, raw_event.pid));
+                                        }
+                                        EventType::Client => {
+                                            node.clis += 1;
+                                            event_msg = Some(format!("🔗 Cli Create: [{}] (PID: {})", cleaned, raw_event.pid));
+                                        }
+                                        _ => {}
                                     }
-                                    EventType::Publisher => {
-                                        node.pubs += 1;
-                                        event_msg = Some(format!("📡 Pub Create: [{}] (PID: {})", cleaned, raw_event.pid));
-                                    }
-                                    EventType::Subscription => {
-                                        node.subs += 1;
-                                        event_msg = Some(format!("📥 Sub Create: [{}] (PID: {})", cleaned, raw_event.pid));
-                                    }
-                                    EventType::Service => {
-                                        node.srvs += 1;
-                                        event_msg = Some(format!("⚙️ Srv Create: [{}] (PID: {})", cleaned, raw_event.pid));
-                                    }
-                                    EventType::Client => {
-                                        node.clis += 1;
-                                        event_msg = Some(format!("🔗 Cli Create: [{}] (PID: {})", cleaned, raw_event.pid));
-                                    }
-                                    EventType::ExternalNode => {
-                                         if !cleaned.contains("RTPS") {
-                                            node.name = cleaned.to_string();
-                                         }
-                                         event_msg = Some(format!("🌐 Remote Node activity from {}", node.src_ip.as_deref().unwrap_or("?")));
-                                    }
-                                    _ => {}
                                 }
                             }
                         }
-                    } else if let Some(discovered_name) = find_node_name(data) {
-                        node.name = discovered_name.clone();
-                        event_msg = Some(format!("🤖 Discovery: [{}] (PID: {})", discovered_name, raw_event.pid));
+                    } else {
+                        if data.len() >= 4 && data[0] == b'R' && data[1] == b'T' && data[2] == b'P' && data[3] == b'S' {
+                            if raw_event.event_type == EventType::RawPacket {
+                                node.pkts_sent += 1;
+                                node.bytes_sent += raw_event.len as u64;
+                            } else if raw_event.event_type == EventType::ExternalNode {
+                                node.pkts_recv += 1;
+                                node.bytes_recv += raw_event.len as u64;
+                            }
+
+                            if let Some(discovered_name) = find_node_name(data) {
+                                if node.name == "Unknown" || node.name == "Remote Participant" {
+                                    node.name = discovered_name.clone();
+                                    if raw_event.event_type == EventType::ExternalNode {
+                                        event_msg = Some(format!("🤖 Discovery: [{}] (Remote: {})", discovered_name, node.src_ip.as_deref().unwrap_or("?")));
+                                    } else {
+                                        event_msg = Some(format!("🤖 Discovery: [{}] (PID: {})", discovered_name, raw_event.pid));
+                                    }
+                                }
+                            } else if raw_event.event_type == EventType::ExternalNode && node.name == "Unknown" {
+                                node.name = "Remote Participant".to_string();
+                            }
+                        }
                     }
                     
                     if let Some(msg) = event_msg {
@@ -222,6 +277,9 @@ async fn main() -> anyhow::Result<()> {
     }
 
     loop {
+        {
+            state.lock().unwrap().update_rates();
+        }
         terminal.draw(|f| ui(f, &state.lock().unwrap()))?;
 
         if event::poll(Duration::from_millis(100))? {
@@ -281,6 +339,41 @@ fn format_mac(mac: [u8; 6]) -> String {
     format!("{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}", mac[0], mac[1], mac[2], mac[3], mac[4], mac[5])
 }
 
+fn format_bandwidth(bytes: u64) -> String {
+    if bytes < 1024 {
+        format!("{} B", bytes)
+    } else if bytes < 1024 * 1024 {
+        format!("{:.1} KB", bytes as f64 / 1024.0)
+    } else if bytes < 1024 * 1024 * 1024 {
+        format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
+    } else {
+        format!("{:.1} GB", bytes as f64 / (1024.0 * 1024.0 * 1024.0))
+    }
+}
+
+fn format_rate(rate: f64) -> String {
+    if rate < 1024.0 {
+        format!("{:.1} B/s", rate)
+    } else if rate < 1024.0 * 1024.0 {
+        format!("{:.1} KB/s", rate / 1024.0)
+    } else if rate < 1024.0 * 1024.0 * 1024.0 {
+        format!("{:.1} MB/s", rate / (1024.0 * 1024.0))
+    } else {
+        format!("{:.1} GB/s", rate / (1024.0 * 1024.0 * 1024.0))
+    }
+}
+
+fn format_duration(d: Duration) -> String {
+    let secs = d.as_secs();
+    if secs < 1 {
+        format!("{}ms", d.subsec_millis())
+    } else if secs < 60 {
+        format!("{}s", secs)
+    } else {
+        format!("{}m {}s", secs / 60, secs % 60)
+    }
+}
+
 fn ui(f: &mut Frame, state: &MonitorState) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -296,7 +389,7 @@ fn ui(f: &mut Frame, state: &MonitorState) {
         .block(Block::default().borders(Borders::ALL).title("Status"));
     f.render_widget(title, chunks[0]);
 
-    let header_cells = ["Identity", "Source", "Pub/Sub", "Srv/Cli", "Pkts", "Seen"]
+    let header_cells = ["Identity", "Source", "Pub/Sub", "Srv/Cli", "TX (Sent)", "RX (Received)", "Seen"]
         .iter()
         .map(|h| Cell::from(*h).style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)));
     let header = Row::new(header_cells).height(1).bottom_margin(1);
@@ -317,7 +410,12 @@ fn ui(f: &mut Frame, state: &MonitorState) {
         let identity = if info.src_ip.is_some() {
             format!("🌐 {}", info.name)
         } else {
-            format!("🛡️ {}", info.name)
+            let display_name = if info.name == "/" || info.name == "Unknown" {
+                &info.proc_name
+            } else {
+                &info.name
+            };
+            format!("🛡️ {}", display_name)
         };
         let source = if let Some(ip) = &info.src_ip {
             format!("{} ({})", ip, info.src_mac.as_deref().unwrap_or("?"))
@@ -325,24 +423,37 @@ fn ui(f: &mut Frame, state: &MonitorState) {
             format!("PID: {} ({})", id, info.proc_name)
         };
 
+        let tx_str = if info.bytes_sent > 0 || info.pkts_sent > 0 {
+            format!("{} ({}) @ {}", format_bandwidth(info.bytes_sent), info.pkts_sent, format_rate(info.tx_rate))
+        } else {
+            "-".to_string()
+        };
+        let rx_str = if info.bytes_recv > 0 || info.pkts_recv > 0 {
+            format!("{} ({}) @ {}", format_bandwidth(info.bytes_recv), info.pkts_recv, format_rate(info.rx_rate))
+        } else {
+            "-".to_string()
+        };
+
         let cells = vec![
             Cell::from(identity),
             Cell::from(source),
             Cell::from(format!("{}/{}", info.pubs, info.subs)),
             Cell::from(format!("{}/{}", info.srvs, info.clis)),
-            Cell::from(info.packets.to_string()),
-            Cell::from(format!("{:?} ago", info.last_seen.elapsed())),
+            Cell::from(tx_str),
+            Cell::from(rx_str),
+            Cell::from(format_duration(info.last_seen.elapsed()) + " ago"),
         ];
         Row::new(cells)
     });
 
     let table = Table::new(rows, [
-        Constraint::Percentage(25),
-        Constraint::Percentage(25),
-        Constraint::Percentage(10),
-        Constraint::Percentage(10),
-        Constraint::Percentage(10),
-        Constraint::Percentage(20),
+        Constraint::Percentage(15),
+        Constraint::Percentage(18),
+        Constraint::Percentage(8),
+        Constraint::Percentage(8),
+        Constraint::Percentage(21),
+        Constraint::Percentage(21),
+        Constraint::Percentage(9),
     ])
     .header(header)
     .block(Block::default().borders(Borders::ALL).title("Active ROS 2 / System Nodes"))
@@ -367,15 +478,35 @@ fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) 
 }
 
 fn find_node_name(data: &[u8]) -> Option<String> {
-    for i in 0..(data.len().saturating_sub(8)) {
+    for i in 0..(data.len().saturating_sub(12)) {
+        // Little Endian pattern: PID_ENTITY_NAME is 0x0062 -> serialized as [0x62, 0x00]
         if data[i] == 0x62 && data[i+1] == 0x00 {
-            let len = u16::from_le_bytes([data[i+2], data[i+3]]) as usize;
-            if len > 1 && len < 64 && i + 4 + len <= data.len() {
-                let name_bytes = &data[i+4..i+4+len];
-                if let Ok(name) = std::str::from_utf8(name_bytes) {
-                    let cleaned = name.trim_matches(char::from(0)).trim();
-                    if !cleaned.is_empty() {
-                        return Some(cleaned.to_string());
+            let param_len = u16::from_le_bytes([data[i+2], data[i+3]]) as usize;
+            if param_len >= 4 && i + 4 + param_len <= data.len() {
+                let str_len = u32::from_le_bytes([data[i+4], data[i+5], data[i+6], data[i+7]]) as usize;
+                if str_len > 1 && str_len <= param_len - 4 && i + 8 + str_len <= data.len() {
+                    let name_bytes = &data[i+8..i+8+str_len];
+                    if let Ok(name) = std::str::from_utf8(name_bytes) {
+                        let cleaned = name.trim_matches(char::from(0)).trim();
+                        if !cleaned.is_empty() {
+                            return Some(cleaned.to_string());
+                        }
+                    }
+                }
+            }
+        }
+        // Big Endian pattern: PID_ENTITY_NAME is 0x0062 -> serialized as [0x00, 0x62]
+        else if data[i] == 0x00 && data[i+1] == 0x62 {
+            let param_len = u16::from_be_bytes([data[i+2], data[i+3]]) as usize;
+            if param_len >= 4 && i + 4 + param_len <= data.len() {
+                let str_len = u32::from_be_bytes([data[i+4], data[i+5], data[i+6], data[i+7]]) as usize;
+                if str_len > 1 && str_len <= param_len - 4 && i + 8 + str_len <= data.len() {
+                    let name_bytes = &data[i+8..i+8+str_len];
+                    if let Ok(name) = std::str::from_utf8(name_bytes) {
+                        let cleaned = name.trim_matches(char::from(0)).trim();
+                        if !cleaned.is_empty() {
+                            return Some(cleaned.to_string());
+                        }
                     }
                 }
             }

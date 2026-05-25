@@ -5,7 +5,7 @@ use aya_ebpf::{
     macros::{tracepoint, map, uprobe, classifier},
     maps::{PerfEventArray, PerCpuArray},
     programs::{TracePointContext, ProbeContext, TcContext},
-    helpers::{bpf_get_current_pid_tgid, bpf_probe_read_user, bpf_probe_read_user_str_bytes},
+    helpers::{bpf_get_current_pid_tgid, bpf_probe_read_user_str_bytes, bpf_probe_read_user_buf},
 };
 use botguard_common::{PacketEvent, EventType};
 use network_types::{
@@ -106,7 +106,7 @@ fn try_botguard_capture(ctx: &TracePointContext, buff_off: usize, len_off: usize
     let buff_ptr: *const u8 = unsafe { ctx.read_at(buff_off).map_err(|_| 0u32)? };
     let len: usize = unsafe { ctx.read_at(len_off).map_err(|_| 0u32)? };
 
-    if len > 0 {
+    if len >= 4 {
         let event = unsafe { 
             let ptr = SCRATCHPAD.get_ptr_mut(0).ok_or(0u32)?;
             &mut *ptr
@@ -119,8 +119,10 @@ fn try_botguard_capture(ctx: &TracePointContext, buff_off: usize, len_off: usize
         event.src_mac = [0; 6];
 
         unsafe {
-            event.packet = bpf_probe_read_user(buff_ptr as *const [u8; 128]).map_err(|_| 0u32)?;
-            EVENTS.output(ctx, event, 0);
+            bpf_probe_read_user_buf(buff_ptr, &mut event.packet).map_err(|_| 0u32)?;
+            if event.packet[0] == b'R' && event.packet[1] == b'T' && event.packet[2] == b'P' && event.packet[3] == b'S' {
+                EVENTS.output(ctx, event, 0);
+            }
         }
     }
 
@@ -160,7 +162,7 @@ fn try_botguard_network_capture(ctx: &TcContext) -> Result<(), ()> {
         let skb_len = ctx.len() as usize;
         if skb_len > payload_off {
              let _ = ctx.load_bytes(payload_off, &mut event.packet).map_err(|_| ())?;
-             event.len = 128;
+             event.len = skb_len as u32;
         } else {
             event.len = 0;
         }

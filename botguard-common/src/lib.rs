@@ -1,6 +1,6 @@
 #![no_std]
 
-pub const MAX_PACKET_SIZE: usize = 128;
+pub const MAX_PACKET_SIZE: usize = 512;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u32)]
